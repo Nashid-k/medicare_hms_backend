@@ -123,7 +123,29 @@ function removePatientClinicalData(patient) {
   delete patientData.chronicConditions;
   delete patientData.vitals;
   delete patientData.clinicalNotes;
+  delete patientData.diagnosis;
   return patientData;
+}
+
+async function resolveDoctorForRequest(req) {
+  const decoded = decodeAuthToken(req.headers['authorization']);
+  const email = (decoded && decoded.email) || req.headers['x-user-email'] || req.query.email || '';
+  const doctorName = req.headers['x-doctor-name'] || req.headers['x-user-name'] || req.query.doctorName || '';
+
+  if (doctorName) {
+    const docByName = await Doctor.findOne({
+      name: new RegExp('^' + doctorName.trim().replace(/^Dr\.\s*/i, 'Dr\\. ') + '$', 'i')
+    });
+    if (docByName) return docByName;
+  }
+  if (email) {
+    const user = await User.findOne({ email: email.toLowerCase() });
+    if (user) {
+      const doc = await Doctor.findOne({ name: new RegExp(user.name.trim(), 'i') });
+      if (doc) return doc;
+    }
+  }
+  return (await Doctor.findOne({ name: 'Dr. Sarah Jenkins' })) || (await Doctor.findOne());
 }
 
 function requireClinicalAccess(req, res, next) {
@@ -428,7 +450,140 @@ router.get('/dashboard', async (req, res) => {
       .filter((inv) => inv.status !== 'Paid')
       .reduce((acc, inv) => acc + inv.subtotal, 0);
 
-    res.json({
+    // -------------------------------------------------------------------------
+    // ROLE: DOCTOR (Clinical Desk: My Patients, My Appointments, Critical Labs)
+    // -------------------------------------------------------------------------
+    if (role === 'doctor') {
+      const myDoctor = await resolveDoctorForRequest(req);
+      const doctorName = myDoctor?.name || 'Dr. Sarah Jenkins';
+      const doctorDept = myDoctor?.department || 'Cardiology Wing';
+
+      // Appointments assigned to this doctor or department
+      const myAppointments = appointments.filter(
+        (a) => a.doctorName === doctorName || a.doctorId === myDoctor?.employeeId || a.doctorId === String(myDoctor?._id)
+      );
+      const displayAppointments = myAppointments.length > 0 ? myAppointments : appointments;
+
+      // Patients under doctor's care (attending) or department
+      const myPatients = patients.filter(
+        (p) => p.attendingDoctor === doctorName || p.department === doctorDept
+      );
+      const myInpatients = patients.filter(
+        (p) => (p.attendingDoctor === doctorName || p.department === doctorDept) && (p.status === 'Inpatient' || p.status === 'Critical ICU')
+      );
+
+      // Lab orders: ordered by doctor or for their patients/department, critical/high alerts
+      const doctorLabs = labs.filter(
+        (l) => l.orderedBy === doctorName || myPatients.some((p) => p.mrn === l.mrn)
+      );
+      const displayLabs = doctorLabs.length > 0 ? doctorLabs : labs;
+      const urgentLabAlerts = displayLabs.filter((l) => l.flag === 'Critical' || l.flag === 'High').length;
+
+      // Doctor's prescriptions
+      const myPrescriptions = prescriptions.filter((p) => p.doctorName === doctorName);
+      const displayPrescriptions = myPrescriptions.length > 0 ? myPrescriptions : prescriptions;
+
+      // Clinical audit logs
+      const clinicalAuditLogs = auditLogs.filter(
+        (l) => l.actionType === 'CONSULT' || l.actionType === 'LAB_STAT' || l.actionType === 'ADMISSION'
+      );
+
+      return res.json({
+        role: 'doctor',
+        doctorProfile: myDoctor,
+        stats: {
+          consultationsToday: myAppointments.length,
+          waitingPatients: myAppointments.filter((a) => a.status === 'Waiting' || a.status === 'Checked-In').length,
+          completedConsultations: myAppointments.filter((a) => a.status === 'Completed').length,
+          myInpatients: myInpatients.length,
+          totalAssignedPatients: myPatients.length,
+          urgentLabAlerts,
+          activePrescriptionsCount: displayPrescriptions.filter((p) => p.status === 'Pending').length,
+          occupiedBeds,
+          availableBeds
+        },
+        patients, // full EHR for doctors
+        doctors,
+        appointments: displayAppointments,
+        prescriptions: displayPrescriptions,
+        inventory: [], // doctors do not manage inventory batches
+        invoices: [], // doctors do not manage billing/claims
+        beds,
+        labs: displayLabs,
+        auditLogs: clinicalAuditLogs
+      });
+    }
+
+    // -------------------------------------------------------------------------
+    // ROLE: RECEPTIONIST (Front Desk: Tokens, Waiting Room, Bed Matrix, Demographics)
+    // -------------------------------------------------------------------------
+    if (role === 'receptionist') {
+      const sanitizedPatients = patients.map(removePatientClinicalData);
+      const receptionAuditLogs = auditLogs.filter(
+        (l) => l.actionType === 'BOOKING' || l.actionType === 'ADMISSION'
+      );
+
+      return res.json({
+        role: 'receptionist',
+        stats: {
+          appointmentsToday: appointments.length,
+          waitingAppointments: appointments.filter((a) => a.status === 'Waiting' || a.status === 'Checked-In').length,
+          completedAppointments: appointments.filter((a) => a.status === 'Completed').length,
+          inConsultationAppointments: appointments.filter((a) => a.status === 'In-Consultation').length,
+          totalPatients: patients.length,
+          occupiedBeds,
+          availableBeds,
+          totalBeds: beds.length,
+          bedOccupancyRate: beds.length ? Math.round((occupiedBeds / beds.length) * 100) : 0
+        },
+        patients: sanitizedPatients, // Strictly sanitized demographics (no clinical notes, vitals, diagnosis)
+        doctors,
+        appointments,
+        prescriptions: [], // HIPAA restricted
+        inventory: [], // Restricted
+        invoices, // For registration billing and copays
+        beds, // For admitting patients to beds
+        labs: [], // HIPAA restricted
+        auditLogs: receptionAuditLogs
+      });
+    }
+
+    // -------------------------------------------------------------------------
+    // ROLE: PHARMACIST (Pharmacy Dispensing, Batch Tracking, Low Stock Alerts)
+    // -------------------------------------------------------------------------
+    if (role === 'pharmacist') {
+      const nearExpiryCount = inventory.filter((b) => b.status === 'Near Expiry').length;
+      const pharmacyAuditLogs = auditLogs.filter(
+        (l) => l.actionType === 'DISPENSED' || l.actionType === 'INTAKE'
+      );
+
+      return res.json({
+        role: 'pharmacist',
+        stats: {
+          pendingRx,
+          dispensedRx,
+          totalPrescriptions: prescriptions.length,
+          lowStockCount,
+          nearExpiryCount,
+          totalBatches: inventory.length
+        },
+        patients: [], // Pharmacists fulfill by prescription, no clinical records browsing
+        doctors, // Prescribers directory
+        appointments: [], // Pharmacists don't manage outpatient doctor queues
+        prescriptions,
+        inventory,
+        invoices: [],
+        beds: [],
+        labs: [],
+        auditLogs: pharmacyAuditLogs
+      });
+    }
+
+    // -------------------------------------------------------------------------
+    // ROLE: ADMIN (Executive 360: Financial Velocity, Operations, Security Audit)
+    // -------------------------------------------------------------------------
+    return res.json({
+      role: 'admin',
       stats: {
         totalPatients: patients.length,
         activeInpatients: patients.filter((p) => p.status === 'Inpatient' || p.status === 'Critical ICU').length,
@@ -448,19 +603,15 @@ router.get('/dashboard', async (req, res) => {
         paidRevenue,
         pendingRevenue
       },
-      patients: role === 'doctor'
-        ? patients
-        : role === 'receptionist'
-          ? patients.map(removePatientClinicalData)
-          : [],
+      patients: patients.map(removePatientClinicalData),
       doctors,
-      appointments: ['doctor', 'receptionist', 'admin'].includes(role) ? appointments : [],
-      prescriptions: ['doctor', 'pharmacist'].includes(role) ? prescriptions : [],
-      inventory: ['pharmacist', 'admin'].includes(role) ? inventory : [],
-      invoices: ['receptionist', 'admin'].includes(role) ? invoices : [],
-      beds: ['doctor', 'receptionist', 'admin'].includes(role) ? beds : [],
-      labs: role === 'doctor' ? labs : [],
-      auditLogs: role === 'admin' ? auditLogs : []
+      appointments,
+      prescriptions,
+      inventory,
+      invoices,
+      beds,
+      labs,
+      auditLogs
     });
   } catch (err) {
     res.status(500).json({ error: err.message });
@@ -476,8 +627,11 @@ router.get('/patients', async (req, res) => {
       const myPatient = await resolvePatientForRequest(req);
       return res.json(myPatient ? [myPatient] : []);
     }
+    if (role === 'pharmacist') {
+      return res.json([]);
+    }
     const patients = await Patient.find().sort({ createdAt: -1 });
-    res.json(role === 'doctor' ? patients : role === 'receptionist' ? patients.map(removePatientClinicalData) : []);
+    res.json(role === 'doctor' ? patients : patients.map(removePatientClinicalData));
   } catch (err) {
     res.status(500).json({ error: err.message });
   }
@@ -581,6 +735,10 @@ router.get('/doctors', async (req, res) => {
 
 router.post('/doctors', async (req, res) => {
   try {
+    const role = getRequestRole(req);
+    if (role && role !== 'admin') {
+      return res.status(403).json({ error: 'Access denied: Only hospital administrators can credential and onboard physicians.' });
+    }
     const employeeId = req.body.employeeId || `DOC-${Math.floor(200 + Math.random() * 799)}`;
     const doctor = await Doctor.create({
       ...req.body,
@@ -1163,6 +1321,10 @@ router.get('/inventory', async (req, res) => {
 
 router.post('/inventory', async (req, res) => {
   try {
+    const role = getRequestRole(req);
+    if (role && !['pharmacist', 'admin'].includes(role)) {
+      return res.status(403).json({ error: 'Access denied: Only pharmacy personnel and administrators can intake inventory.' });
+    }
     const batchId = req.body.batchId || `BAT-${Math.floor(10000 + Math.random() * 89999)}`;
     const qty = Number(req.body.quantity) || 100;
     const minLevel = Number(req.body.minLevel) || 50;
@@ -1463,6 +1625,18 @@ router.put('/beds/:id', async (req, res) => {
 // 8. LAB & RADIOLOGY ORDERS
 router.get('/labs', async (req, res) => {
   try {
+    const role = getRequestRole(req);
+    if (role === 'receptionist' || role === 'pharmacist') {
+      return res.status(403).json({ error: 'Access denied: Diagnostic laboratory orders and pathology findings are restricted to clinical staff.' });
+    }
+    if (role === 'patient') {
+      const myPatient = await resolvePatientForRequest(req);
+      if (!myPatient) return res.json([]);
+      const myLabs = await LabOrder.find({
+        $or: [{ mrn: myPatient.mrn }, { patientName: myPatient.name }]
+      }).sort({ createdAt: -1 });
+      return res.json(myLabs);
+    }
     const labs = await LabOrder.find().sort({ createdAt: -1 });
     res.json(labs);
   } catch (err) {
