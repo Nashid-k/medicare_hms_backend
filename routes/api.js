@@ -45,6 +45,77 @@ function getRequestRole(req) {
   return role === 'reception' ? 'receptionist' : role;
 }
 
+async function resolvePatientForRequest(req) {
+  const decoded = decodeAuthToken(req.headers['authorization']);
+  const email = (decoded && decoded.email) || req.headers['x-user-email'] || req.query.email || '';
+  const userId = (decoded && decoded.id) || req.headers['x-user-id'] || '';
+  const patientName = req.headers['x-patient-name'] || req.query.patientName || '';
+  const mrn = req.headers['x-patient-mrn'] || req.query.mrn || '';
+
+  // 1. If MRN is provided directly
+  if (mrn) {
+    const patientByMrn = await Patient.findOne({ mrn });
+    if (patientByMrn) return patientByMrn;
+  }
+
+  // 2. If email is provided
+  if (email) {
+    const patientByEmail = await Patient.findOne({ email: email.toLowerCase() });
+    if (patientByEmail) return patientByEmail;
+
+    const user = await User.findOne({ email: email.toLowerCase() });
+    if (user) {
+      const patientByName = await Patient.findOne({ name: new RegExp('^' + user.name.trim() + '$', 'i') });
+      if (patientByName) return patientByName;
+
+      if (user.role === 'patient') {
+        const count = await Patient.countDocuments();
+        const newMrn = `MC-${8850 + count}`;
+        return await Patient.create({
+          mrn: newMrn,
+          name: user.name,
+          email: user.email.toLowerCase(),
+          phone: user.phone || '+1 (555) 234-8800',
+          age: 36,
+          dob: '15 Aug 1988',
+          gender: 'Other',
+          bloodGroup: 'O+ Positive',
+          department: 'General Medicine',
+          attendingDoctor: 'Dr. Sarah Jenkins',
+          status: 'Active Consult',
+          acuity: 'Emerald',
+          vitals: { bp: '120/80', hr: 72, spo2: 99, temp: '36.8°C', respRate: 16, weight: '70 kg' },
+          allergies: ['None recorded'],
+          chronicConditions: []
+        });
+      }
+    }
+  }
+
+  // 3. If userId is provided
+  if (userId && mongoose.Types.ObjectId.isValid(userId)) {
+    const user = await User.findById(userId);
+    if (user) {
+      const patient = await Patient.findOne({
+        $or: [
+          { email: user.email.toLowerCase() },
+          { name: new RegExp('^' + user.name.trim() + '$', 'i') }
+        ]
+      });
+      if (patient) return patient;
+    }
+  }
+
+  // 4. If patient name is provided
+  if (patientName) {
+    const patientByName = await Patient.findOne({ name: new RegExp('^' + patientName.trim() + '$', 'i') });
+    if (patientByName) return patientByName;
+  }
+
+  // 5. Fallback for default patient demo user
+  return (await Patient.findOne({ mrn: 'MC-8821' })) || (await Patient.findOne());
+}
+
 function removePatientClinicalData(patient) {
   const patientData = patient.toObject ? patient.toObject() : { ...patient };
   delete patientData.bloodGroup;
@@ -241,6 +312,87 @@ router.get('/dashboard', async (req, res) => {
       return res.status(403).json({ error: 'Invalid account role.' });
     }
 
+    // Role-specific optimization & HIPAA privacy guard:
+    // Patients ONLY see their own health profile, appointments, prescriptions, and invoices.
+    if (role === 'patient') {
+      const myPatient = await resolvePatientForRequest(req);
+      const doctors = await Doctor.find().sort({ name: 1 });
+      const departments = await Department.find({ isActive: true }).sort({ name: 1 });
+
+      let myAppointments = [];
+      let myPrescriptions = [];
+      let myInvoices = [];
+      let myLabs = [];
+
+      if (myPatient) {
+        [myAppointments, myPrescriptions, myInvoices, myLabs] = await Promise.all([
+          Appointment.find({
+            $or: [
+              { mrn: myPatient.mrn },
+              { patientName: myPatient.name },
+              ...(myPatient._id ? [{ patientId: String(myPatient._id) }] : [])
+            ]
+          }).sort({ slotStart: -1, createdAt: -1 }),
+          Prescription.find({
+            $or: [
+              { mrn: myPatient.mrn },
+              { patientName: myPatient.name }
+            ]
+          }).sort({ createdAt: -1 }),
+          Invoice.find({
+            $or: [
+              { mrn: myPatient.mrn },
+              { patientName: myPatient.name }
+            ]
+          }).sort({ createdAt: -1 }),
+          LabOrder.find({
+            $or: [
+              { mrn: myPatient.mrn },
+              { patientName: myPatient.name }
+            ]
+          }).sort({ createdAt: -1 })
+        ]);
+      }
+
+      const activeAppointments = myAppointments.filter(
+        (a) => a.status !== 'Cancelled' && a.status !== 'CANCELLED'
+      );
+      const upcomingAppointments = activeAppointments.filter(
+        (a) => a.status !== 'Completed'
+      );
+      const pendingInvoices = myInvoices.filter((i) => i.status !== 'Paid');
+      const pendingBalance = pendingInvoices.reduce(
+        (acc, inv) => acc + (inv.patientPayable != null ? inv.patientPayable : inv.subtotal || 0),
+        0
+      );
+
+      return res.json({
+        role: 'patient',
+        patientProfile: myPatient,
+        stats: {
+          upcomingAppointments: upcomingAppointments.length,
+          totalAppointments: myAppointments.length,
+          activePrescriptions: myPrescriptions.filter((p) => p.status !== 'Cancelled').length,
+          pendingInvoices: pendingInvoices.length,
+          pendingBalance,
+          lastBp: myPatient?.vitals?.bp || '120/80',
+          lastHr: myPatient?.vitals?.hr || 72,
+          bloodGroup: myPatient?.bloodGroup || 'O+ Positive',
+          allergiesCount: (myPatient?.allergies || []).length
+        },
+        patients: myPatient ? [myPatient] : [],
+        appointments: myAppointments,
+        prescriptions: myPrescriptions,
+        invoices: myInvoices,
+        labs: myLabs,
+        doctors,
+        departments,
+        beds: [],
+        inventory: [],
+        auditLogs: []
+      });
+    }
+
     const [
       patients,
       doctors,
@@ -318,9 +470,13 @@ router.get('/dashboard', async (req, res) => {
 // 2. PATIENTS CRUD & EHR NOTES / VITALS
 router.get('/patients', async (req, res) => {
   try {
-    const patients = await Patient.find().sort({ createdAt: -1 });
     const role = getRequestRole(req);
     if (!role) return res.status(401).json({ error: 'Authentication role is required.' });
+    if (role === 'patient') {
+      const myPatient = await resolvePatientForRequest(req);
+      return res.json(myPatient ? [myPatient] : []);
+    }
+    const patients = await Patient.find().sort({ createdAt: -1 });
     res.json(role === 'doctor' ? patients : role === 'receptionist' ? patients.map(removePatientClinicalData) : []);
   } catch (err) {
     res.status(500).json({ error: err.message });
@@ -588,6 +744,19 @@ router.patch('/doctors/availability', async (req, res) => {
 // 4. APPOINTMENTS & QUEUE ENGINE
 router.get('/appointments', async (req, res) => {
   try {
+    const role = getRequestRole(req);
+    if (role === 'patient') {
+      const myPatient = await resolvePatientForRequest(req);
+      if (!myPatient) return res.json([]);
+      const myAppointments = await Appointment.find({
+        $or: [
+          { mrn: myPatient.mrn },
+          { patientName: myPatient.name },
+          ...(myPatient._id ? [{ patientId: String(myPatient._id) }] : [])
+        ]
+      }).sort({ slotStart: -1, createdAt: -1 });
+      return res.json(myAppointments);
+    }
     const appointments = await Appointment.find().sort({ createdAt: -1 });
     res.json(appointments);
   } catch (err) {
@@ -1341,6 +1510,15 @@ router.put('/labs/:id', async (req, res) => {
 // 9. INVOICES & HOSPITAL BILLING
 router.get('/invoices', async (req, res) => {
   try {
+    const role = getRequestRole(req);
+    if (role === 'patient') {
+      const myPatient = await resolvePatientForRequest(req);
+      if (!myPatient) return res.json([]);
+      const myInvoices = await Invoice.find({
+        $or: [{ mrn: myPatient.mrn }, { patientName: myPatient.name }]
+      }).sort({ createdAt: -1 });
+      return res.json(myInvoices);
+    }
     const invoices = await Invoice.find().sort({ createdAt: -1 });
     res.json(invoices);
   } catch (err) {

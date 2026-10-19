@@ -1650,8 +1650,9 @@ module.exports = { seedDatabase };
 if (require.main === module) {
   const mongoose = require('mongoose');
   require('dotenv').config();
+  const MONGO_URI = process.env.MONGODB_URI || process.env.MONGO_URI || 'mongodb://127.0.0.1:27017/medicare_hms';
   mongoose
-    .connect(process.env.MONGO_URI || 'mongodb://127.0.0.1:27017/medicare_hms')
+    .connect(MONGO_URI)
     .then(async () => {
       await seedDatabase(true);
       process.exit(0);
