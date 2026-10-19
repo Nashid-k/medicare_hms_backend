@@ -4,8 +4,11 @@ const mongoose = require('mongoose');
 const apiRoutes = require('./routes/api');
 
 const app = express();
+const frontendUrl = process.env.FRONTEND_URL || 'http://localhost:5173';
 
-app.use(cors());
+app.use(cors({
+  origin: (origin, callback) => callback(null, !origin || origin === frontendUrl)
+}));
 app.use(express.json({ limit: '10mb' }));
 
 // Health check endpoint
