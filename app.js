@@ -12,12 +12,14 @@ app.use(cors({
 app.use(express.json({ limit: '10mb' }));
 
 // Health check endpoint
-app.get('/api/health', (req, res) => {
-  res.json({
-    status: 'Operational',
-    node: 'Clinical Node 04',
-    uptime: '99.98%',
-    database: mongoose.connection.readyState === 1 ? 'Connected' : 'Connecting'
+app.get('/api/health', (_req, res) => {
+  const databaseReady = mongoose.connection.readyState === 1;
+
+  res.status(databaseReady ? 200 : 503).json({
+    status: databaseReady ? 'Operational' : 'Degraded',
+    nodeVersion: process.version,
+    uptimeSeconds: Math.floor(process.uptime()),
+    database: databaseReady ? 'Connected' : 'Unavailable'
   });
 });
 
